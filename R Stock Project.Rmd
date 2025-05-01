@@ -1,0 +1,372 @@
+---
+title: "Impact of Sentiment on Stock Performance Project"
+output:
+  html_document:
+    df_print: paged
+---
+
+# Project Description
+This project provides an analysis of the correlation between social media investor sentiment and stock performance/volatility. My project looks at a selection of stocks from the 2021 boom, and 2025 to provide a comparative analysis of how online sentiment impacted their trends. The main question I wanted to answer was: "Can investor sentiment on social media predict short-term stock price movement"? Ancillary questions I initially aimed to address were the following:
+
+- Does social media sentiment correlate with increased volatility or trading volume in any specific stocks?
+- Are there noticeable differences in how +/- sentiments impact returns?
+
+#Dataset Description/Dictionary
+Stock price data was gathered using tidyquant/quantmod within R. 2021 stocks were selected from reviewing online news sources covering the 2021 boom. These stocks include:
+
+- Gamestop and AMC
+
+2025 Stocks were selected after perusing online financial news covering the alleged promising growth in recent "meme" stocks. These stocks include:
+
+- Chewy, Archer Aviation, Marathon Digital holdings, MicroStrategy, and Super Micro Computer Inc.
+
+Sentiment data was gathered using Reddit webscraping from the subreddit "wallstreetbets".
+
+
+
+# Load in Packages
+```{r}
+library(jsonlite)
+library(tidyr)
+library(tidyverse)
+library(stringr)
+library(ggplot2)
+library(ggthemes)
+library(tidyquant)
+library(quantmod)
+library(dbplyr)
+library(lubridate)
+library(httr)
+library(sentimentr)
+library(ggpubr)
+```
+
+# Load in Stock Price Data from Yahoo Finance
+```{r}
+# Set stock tickers for each period
+tickers_2021 <- c("GME", "AMC")
+tickers_2025 <- c("CHWY", "ACHR", "MARA", "MSTR", "SMCI")
+
+# Get daily adjusted close prices for each ticker/symbol.
+tickers_all <- c(tickers_2021, tickers_2025)
+stock_prices <- tq_get(tickers_all, get = "stock.prices", from = "2021-01-01", to = "2025-04-11") |>
+  select(symbol, date, adjusted)
+```
+
+# Data Cleaning & Processing/Aggregation
+```{r}
+# Grouping stock_prices by ticker, and creating daily_return value
+stock_prices <- stock_prices |> 
+  group_by(symbol) |>
+  mutate(daily_return =(adjusted/ lag(adjusted)) -1) #(today - yesterday/yesterday)
+
+head(stock_prices)
+
+# Summary Statistics for stock_prices df
+stock_prices |> 
+  summary()
+```
+
+# Initializing Social Media Sentiment Data for 2021/2025 using Reddit API
+```{r}
+# Using info and credentials from created Reddit API to get access token to pull sentiment data from Reddit.
+client_id <- "IHhSelyf-hxevX-Ol9szww"
+client_secret <- "72y7XoQ_Iv_jB63GFCqKdjl9ah_9mQ"
+username      <- "Jabari0624"
+password      <- "8ZLH1d1X"
+
+auth_response <- POST( # Send POST request to reddit to access the token I created using Reddit API.
+  url = "https://www.reddit.com/api/v1/access_token", # Specific url that is utilized by reddit to gain access to OAuth tokens.
+  authenticate(client_id, client_secret), # Pass my reddit API client id/secret to check if it is authenticated/proper.
+  body = list(grant_type = "password", username = username, password = password), # in body of request, I am using password flow, so I then put in user and pass.
+  encode = "form", # I want the body of request to be encoded like a form submission, not as a raw JSON
+  user_agent("R sentiment project")
+)
+
+token <- content(auth_response)$access_token # content() reads the API response, access_token pulls the Oauth token, now it is assigned to a variable named token.
+
+# I log in to reddit and pass verification details for my API, then i receive a token. Now I can use that token with GET function to send requests to Reddit API so i can access the data from the reddit posts.
+```
+
+```{r}
+# Create function to pull Reddit posts by ticker and subreddit (2025)
+get_reddit_data_2025 <- function(subreddit, token, limit = 100) {
+  res <- GET(
+    url = paste0("https://oauth.reddit.com/r/", subreddit, "/search"), # Sends HTTP request to Reddit's OAuth API in wallstreetbets
+    add_headers(Authorization = paste("bearer", token), # Ensures that I am the one who made or has access to this API
+                `User-Agent` = "R sentiment project"),
+    query = list(
+      q = "CHWY OR ACHR OR MARA OR MSTR OR SMCI",  # Specifies search parameters, look for any post mentioning these tickers.
+      sort = "top", # pull the highest upvoted posts!
+      limit = limit, # Set maximum number of posts to retrieve
+      restrict_sr = TRUE # Restrict search to only wallstreetbets
+    )
+  )
+  
+  raw <- content(res, as = "parsed")
+  posts <- raw$data$children # parses raw response into structured object, then holds all posts inside this (posts)
+
+  if (length(posts) == 0) return(data.frame()) # If no posts are found, return empty dataframe
+
+  df <- tibble(
+    title = sapply(posts, function(x) x$data$title), # For each post, identify its title and return a vector of them.
+    selftext = sapply(posts, function(x) x$data$selftext), # For each post, create a vector of the full body text.
+    score = sapply(posts, function(x) x$data$score), # Make a vector of net upvotes (upvotes-downvotes)
+    upvote_ratio = sapply(posts, function(x) x$data$upvote_ratio), # For each post return ratio of upvotes to downvotes
+    created_utc = as.POSIXct(sapply(posts, function(x) x$data$created_utc), origin = "1970-01-01", tz = "UTC"), # Since Reddit stores time as UNIX or seconds since Jan 1 1970, this reformats time into readable date
+    url = sapply(posts, function(x) x$data$url)
+  )
+
+  return(df)
+}
+
+# Use function to get posts about 2025 specified stocks.
+wsb_posts_2025 <- get_reddit_data_2025("wallstreetbets", token, limit = 100)
+
+
+# Get sentiment analysis from wsb_posts_2025.
+wsb_posts_2025$text <- paste(wsb_posts_2025$title, wsb_posts_2025$selftext) # Merge title of the post and body text into single column
+wsb_posts_2025$sentiment <- sentiment_by(wsb_posts_2025$text)$ave_sentiment # Break down text into sentences, calculate sentiment and return avg for each row of text
+
+head(wsb_posts_2025) # View 2025 Reddit sentiment dataframe
+```
+
+
+```{r}
+# Use function to get sentiment data from 2021.
+get_reddit_data_2021 <- function(subreddit, token, limit = 100) {
+  res <- GET(
+    url = paste0("https://oauth.reddit.com/r/", subreddit, "/search"),
+    add_headers(Authorization = paste("bearer", token),
+                `User-Agent` = "R sentiment project"),
+    query = list(
+      q = "GME OR AMC",  
+      sort = "top",
+      limit = limit,
+      restrict_sr = TRUE
+    )
+  )
+  
+  raw <- content(res, as = "parsed")
+  posts <- raw$data$children
+
+  if (length(posts) == 0) return(data.frame())
+
+  df <- tibble(
+    title = sapply(posts, function(x) x$data$title),
+    selftext = sapply(posts, function(x) x$data$selftext),
+    score = sapply(posts, function(x) x$data$score),
+    upvote_ratio = sapply(posts, function(x) x$data$upvote_ratio),
+    created_utc = as.POSIXct(sapply(posts, function(x) x$data$created_utc), origin = "1970-01-01", tz = "UTC"),
+    url = sapply(posts, function(x) x$data$url)
+  )
+
+  return(df)
+}
+
+# Use function to get posts about 2021 specified stocks.
+wsb_posts_2021 <- get_reddit_data_2021("wallstreetbets", token, limit = 100)
+
+
+
+# Get sentiment analysis from wsb_posts_2021.
+wsb_posts_2021$text <- paste(wsb_posts_2021$title, wsb_posts_2021$selftext) # Merge title of the post and body text into single column
+wsb_posts_2021$sentiment <- sentiment_by(wsb_posts_2021$text)$ave_sentiment # Break down text into sentences, calculate sentiment and return avg for each row of text
+
+head(wsb_posts_2021) # View 2021 Reddit sentiment dataframe
+```
+
+```{r}
+# Before joining with stock_price data, add ticker column to 2025 Sentiment dataframe.
+wsb_posts_2025 <- wsb_posts_2025 |> 
+  mutate(ticker = map_chr(title, function(text) { # Go through each post title, apply a function, and return character value for each post 
+    matched <- tickers_2025[sapply(tickers_2025, function(tk) { # Check to see that ticker is found in the title as a whole word because of the //b
+      str_detect(text, paste0("\\b", tk, "\\b"))
+    })]
+    if (length(matched) > 0) matched[1] else NA_character_ # If there are more than 1 tickers found, keep first. if none is mentioned apply NA
+  })) %>%
+  filter(!is.na(ticker))
+
+head(wsb_posts_2025)
+
+# Summarize Setiment by ticker and date
+reddit_sentiment_2025 <- wsb_posts_2025 |>
+  mutate(date = as.Date(created_utc)) |>  
+  group_by(ticker, date) %>%
+  summarise(avg_sentiment = mean(sentiment, na.rm = TRUE), .groups = "drop")
+
+head(reddit_sentiment_2025)
+```
+
+
+```{r}
+# Add ticker column to 2021 Sentiment dataframe.
+wsb_posts_2021 <- wsb_posts_2021 |> 
+  mutate(ticker = map_chr(title, function(text) {
+    matched <- tickers_2021[sapply(tickers_2021, function(tk) {
+      str_detect(text, paste0("\\b", tk, "\\b"))
+    })]
+    if (length(matched) > 0) matched[1] else NA_character_
+  })) %>%
+  filter(!is.na(ticker))
+
+head(wsb_posts_2021)
+
+# Summarize Setiment by ticker and date
+reddit_sentiment_2021 <- wsb_posts_2021 |>
+  mutate(date = as.Date(created_utc)) %>%  
+  group_by(ticker, date) %>%
+  summarise(avg_sentiment = mean(sentiment, na.rm = TRUE), .groups = "drop")
+
+head(reddit_sentiment_2021)
+```
+
+# Joining Sentiment Data with Stock Data
+```{r}
+# Left Join to merge 2021/2025 sentiment data frames with stock price data.
+price_sentiment_2021 <- left_join(reddit_sentiment_2021, 
+                                  stock_prices,
+                                  by = c("ticker" = "symbol", "date" = "date"))
+
+price_sentiment_2025 <- left_join(reddit_sentiment_2025, 
+                                  stock_prices,
+                                  by = c("ticker" = "symbol", "date" = "date"))
+
+#Removing NAs
+ price_sentiment_2021 <- price_sentiment_2021 |>
+  drop_na() 
+ 
+ price_sentiment_2025 <- price_sentiment_2025 |>
+   drop_na()
+```
+
+For my visualizations, I thought of adding a lag to address the question of: "Does yesterday's wallstreetbets sentiment predict/correlate with today's stock price performance?"
+
+# Visualization 1: Relationship bw Lagged Sentiment and Stock Returns (2025)
+```{r}
+lagged_df_2025 <- price_sentiment_2025 %>%
+  group_by(ticker) %>%
+  mutate(lagged_sentiment = lag(avg_sentiment, 1))
+
+ggplot(lagged_df_2025, aes(x = lagged_sentiment * 100, y = daily_return)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", se = FALSE, color = "darkred") +
+  facet_wrap(~ticker) +
+  labs(title = "Lagged Sentiment vs. Daily Return",
+       x = "Previous Day's Sentiment Score (scaled x100)",
+       y = "Daily Return (%)") +
+  theme_minimal()
+```
+
+
+2025 Lagged Results
+
+- ACHR: Mildly positive, as sentiment increases +, stock performance seems to slightly increase
+
+- CHWY: No notable trend line, due to little mention on Reddit.
+
+- MARA: Negative, suggesting positive sentiment had some inverse impact on stock price performance.
+
+- MSTR: Barely positive, suggesting sentiment had weak + impact on stock performance.
+
+- SMCI: slightly negative 
+
+The fact that no interaction effects or controls were utilized in this regression could explain the lack of magnitude in these visualizations.
+Further analysis could be improved by making use of these techniques.
+
+
+
+# Visualization 2: Relationship bw Lagged Sentiment and Stock Returns (2021)
+```{r}
+lagged_df_2021 <- price_sentiment_2021 %>%
+  group_by(ticker) %>%
+  mutate(lagged_sentiment = lag(avg_sentiment, 1))
+
+ggplot(lagged_df_2021, aes(x = lagged_sentiment * 100, y = daily_return)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", se = FALSE, color = "darkred") +
+  facet_wrap(~ticker) +
+  labs(title = "Lagged Sentiment vs. Daily Return",
+       x = "Previous Day's Sentiment Score (scaled x100)",
+       y = "Daily Return (%)") +
+  theme_minimal()
+```
+
+2021 Lagged Results
+
+- AMC: slightly negative, suggesting sentiment had a weak yet inverse impact on stock performance
+
+- GME: mildly positive, sentiment posted on social media had a larger impact on stock performance
+
+Given that GME was the catalyst stock that arguably led to the 2021 boom, it is no surprise that the plot suggests a mild/somewhat strong correlation between wallstreetbets sentiment and stock performance. 
+
+
+
+
+# Visualization 3: Heatmap of Correlations bw Stock Price and Lagged Sentiment by Ticker (2025)
+```{r}
+cor_df_2025 <- lagged_df_2025 %>%
+  group_by(ticker) %>%
+  summarise(cor_sentiment_return = cor(lagged_sentiment, daily_return, use = "complete.obs"))
+
+ggplot(cor_df_2025, aes(x = ticker, y = 1, fill = cor_sentiment_return)) +
+  geom_tile() +
+  geom_text(aes(label = round(cor_sentiment_return, 2)), color = "white") +
+  scale_fill_gradient2(low = "red", high = "green", mid = "gray", midpoint = 0) +
+  labs(title = "Correlation Between Reddit Sentiment and Stock Return (2025)",
+       x = "Ticker", y = "", fill = "Correlation") +
+  theme_minimal()
+```
+2025 Heatmap Analysis
+
+- ACHR has the strongest correlation bw Sentiment and Stock return, suggesting that social media activity was to some degree a significant influence on investor behavior.
+
+- MARA had lowest correlation at -1, which is interesting due to its nature as a digital holdings company.
+
+
+# Visualization 4: Heatmap of Correlations bw Stock Price and Lagged Sentiment by Ticker (2021)
+```{r}
+cor_df_2021 <- lagged_df_2021 %>%
+  group_by(ticker) %>%
+  summarise(cor_sentiment_return = cor(lagged_sentiment, daily_return, use = "complete.obs"))
+
+ggplot(cor_df_2021, aes(x = ticker, y = 1, fill = cor_sentiment_return)) +
+  geom_tile() +
+  geom_text(aes(label = round(cor_sentiment_return, 2)), color = "white") +
+  scale_fill_gradient2(low = "red", high = "green", mid = "gray", midpoint = 0) +
+  labs(title = "Correlation Between Reddit Sentiment and Stock Return (2025)",
+       x = "Ticker", y = "", fill = "Correlation") +
+  theme_minimal()
+```
+2021 Heatmap Analysis
+
+ - Gamestop slightly positive correlation, would have expected a higher correlation coefficient given its status as the catalyst stock.
+ 
+
+# Regression Analysis: Relationship between Sentiment and Daily Stock Returns in 2025
+```{r}
+# Run Regression
+model <- lm(daily_return ~lagged_sentiment, data = lagged_df_2025)
+summary(model)
+```
+Analysis:
+
+- Weak magnitude, signage suggests all else equal a positive sentiment a day prior does linearly predict more favorable stock returns in the next day/period.
+
+# Regression Analysis: Relationship between Sentiment and Daily Stock Returns in 2021
+```{r}
+# Run Regression
+model_2021 <- lm(daily_return ~lagged_sentiment, data = lagged_df_2021)
+summary(model_2021)
+```
+Analysis:
+
+- Slightly improved magnitude compared to 2025
+
+- All else equal reddit sentiment moves in a similar fashion to stock data
+
+- Improved magnitude/lower p-value compared to 2025 regression could suggest during the 2021 boom social media sentiment played a larger role in influencing stock performance.
+
+# Conclusion
+Main limitations of this analysis were that no interaction effects or control/instrumental variables were utilized in the regressions. The addition of such factors could have improved the magnitude of the coefficient estimates, leading to more significant findings. Still, signage for the linear impact of sentiment on stock price seemed to be appropriate.
+
